@@ -4,7 +4,8 @@ import threading
 from pathlib import Path
 from typing import Any, Dict, List
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, Signal, QTimer, QUrl
+from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -60,6 +61,7 @@ class MainWindow(QMainWindow):
         self._init_profiles_tab()
         self._init_general_tab()
         self._init_log_tab()
+        self._init_db_tab()
         self._init_controls()
 
         self.log_signal.connect(self._append_log)
@@ -192,6 +194,61 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.log_output)
         self.tabs.addTab(self.log_tab, "Лог")
 
+    def _init_db_tab(self) -> None:
+        self.db_tab = QWidget()
+        layout = QVBoxLayout(self.db_tab)
+
+        stats_layout = QHBoxLayout()
+        self.db_total_label = QLabel("Total: 0")
+        self.db_new_label = QLabel("New: 0")
+        self.db_in_progress_label = QLabel("InProgress: 0")
+        self.db_opened_label = QLabel("Opened: 0")
+        self.db_error_label = QLabel("Error: 0")
+        stats_layout.addWidget(self.db_total_label)
+        stats_layout.addWidget(self.db_new_label)
+        stats_layout.addWidget(self.db_in_progress_label)
+        stats_layout.addWidget(self.db_opened_label)
+        stats_layout.addWidget(self.db_error_label)
+        layout.addLayout(stats_layout)
+
+        self.db_table = QTableWidget(0, 9)
+        self.db_table.setHorizontalHeaderLabels(
+            [
+                "id",
+                "country",
+                "category",
+                "price",
+                "views",
+                "seller_ads",
+                "status",
+                "first_seen",
+                "url",
+            ]
+        )
+        self.db_table.horizontalHeader().setStretchLastSection(True)
+        self.db_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.db_table.setSelectionMode(QTableWidget.SingleSelection)
+        layout.addWidget(self.db_table)
+
+        controls_layout = QHBoxLayout()
+        refresh_btn = QPushButton("Обновить")
+        refresh_btn.clicked.connect(self._refresh_db_view)
+        copy_btn = QPushButton("Скопировать URL")
+        copy_btn.clicked.connect(self._copy_selected_url)
+        open_btn = QPushButton("Открыть URL")
+        open_btn.clicked.connect(self._open_selected_url)
+        controls_layout.addWidget(refresh_btn)
+        controls_layout.addWidget(copy_btn)
+        controls_layout.addWidget(open_btn)
+        layout.addLayout(controls_layout)
+
+        self.tabs.addTab(self.db_tab, "База")
+
+        self.db_timer = QTimer(self)
+        self.db_timer.setInterval(3000)
+        self.db_timer.timeout.connect(self._refresh_db_view)
+        self.db_timer.start()
+
     def _init_controls(self) -> None:
         control_widget = QWidget()
         control_layout = QHBoxLayout(control_widget)
@@ -225,6 +282,55 @@ class MainWindow(QMainWindow):
 
     def _append_log(self, message: str) -> None:
         self.log_output.appendPlainText(message)
+
+    def _refresh_db_view(self) -> None:
+        counts = db.get_counts_by_status()
+        self.db_total_label.setText(f"Total: {counts.get('total', 0)}")
+        self.db_new_label.setText(f"New: {counts.get('new', 0)}")
+        self.db_in_progress_label.setText(
+            f"InProgress: {counts.get('in_progress', 0)}"
+        )
+        self.db_opened_label.setText(f"Opened: {counts.get('opened', 0)}")
+        self.db_error_label.setText(f"Error: {counts.get('error', 0)}")
+
+        rows = db.get_recent_ads()
+        self.db_table.setRowCount(0)
+        for row_data in rows:
+            ad_id, url, price, views, seller_ads, country, category, status, first_seen = (
+                row_data
+            )
+            row = self.db_table.rowCount()
+            self.db_table.insertRow(row)
+            self.db_table.setItem(row, 0, QTableWidgetItem(str(ad_id)))
+            self.db_table.setItem(row, 1, QTableWidgetItem(country or ""))
+            self.db_table.setItem(row, 2, QTableWidgetItem(category or ""))
+            self.db_table.setItem(row, 3, QTableWidgetItem(str(price or "")))
+            self.db_table.setItem(row, 4, QTableWidgetItem(str(views or "")))
+            self.db_table.setItem(row, 5, QTableWidgetItem(str(seller_ads or "")))
+            self.db_table.setItem(row, 6, QTableWidgetItem(status or ""))
+            self.db_table.setItem(row, 7, QTableWidgetItem(first_seen or ""))
+            self.db_table.setItem(row, 8, QTableWidgetItem(url or ""))
+
+    def _get_selected_url(self) -> str | None:
+        row = self.db_table.currentRow()
+        if row < 0:
+            return None
+        item = self.db_table.item(row, 8)
+        if not item:
+            return None
+        return item.text().strip() or None
+
+    def _copy_selected_url(self) -> None:
+        url = self._get_selected_url()
+        if not url:
+            return
+        QApplication.clipboard().setText(url)
+
+    def _open_selected_url(self) -> None:
+        url = self._get_selected_url()
+        if not url:
+            return
+        QDesktopServices.openUrl(QUrl(url))
 
     def _load_config_into_ui(self) -> None:
         cfg = self.cfg

@@ -44,7 +44,7 @@ def init_db(db_path: str = "data.db") -> None:
         conn.close()
 
 
-def insert_ad_if_new(data: dict, db_path: str = "data.db") -> None:
+def insert_ad_if_new(data: dict, db_path: str = "data.db") -> bool:
     path = _db_path(db_path)
     conn = sqlite3.connect(path, check_same_thread=False)
     try:
@@ -68,7 +68,9 @@ def insert_ad_if_new(data: dict, db_path: str = "data.db") -> None:
                 data.get("seller_name"),
             ),
         )
+        inserted = conn.execute("SELECT changes()").fetchone()[0] == 1
         conn.commit()
+        return inserted
     finally:
         conn.close()
 
@@ -125,5 +127,40 @@ def mark_ad_error(ad_id: int, message: str, db_path: str = "data.db") -> None:
     try:
         conn.execute("UPDATE ads SET status = 'error' WHERE id = ?", (ad_id,))
         conn.commit()
+    finally:
+        conn.close()
+
+
+def get_counts_by_status(db_path: str = "data.db") -> dict:
+    path = _db_path(db_path)
+    conn = sqlite3.connect(path, check_same_thread=False)
+    try:
+        rows = conn.execute(
+            "SELECT status, COUNT(*) FROM ads GROUP BY status"
+        ).fetchall()
+        counts = {"total": 0}
+        total = conn.execute("SELECT COUNT(*) FROM ads").fetchone()[0]
+        counts["total"] = total
+        for status, count in rows:
+            counts[status] = count
+        return counts
+    finally:
+        conn.close()
+
+
+def get_recent_ads(db_path: str = "data.db", limit: int = 200) -> list:
+    path = _db_path(db_path)
+    conn = sqlite3.connect(path, check_same_thread=False)
+    try:
+        rows = conn.execute(
+            """
+            SELECT id, url, price, views, seller_ads, country, category, status, first_seen
+            FROM ads
+            ORDER BY first_seen DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        return rows
     finally:
         conn.close()
