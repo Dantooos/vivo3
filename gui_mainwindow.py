@@ -48,7 +48,11 @@ class MainWindow(QMainWindow):
         self.workers: List[threading.Thread] = []
 
         self.tabs = QTabWidget()
-        self.setCentralWidget(self.tabs)
+
+        central = QWidget()
+        self.main_layout = QVBoxLayout(central)
+        self.main_layout.addWidget(self.tabs)
+        self.setCentralWidget(central)
 
         self._init_categories_tab()
         self._init_filters_tab()
@@ -201,7 +205,7 @@ class MainWindow(QMainWindow):
         control_layout.addWidget(stop_btn)
         control_layout.addWidget(exit_btn)
 
-        self.tabs.layout().addWidget(control_widget)
+        self.main_layout.addWidget(control_widget)
 
     def _browse_categories_dir(self) -> None:
         path = QFileDialog.getExistingDirectory(self, "Выбор папки категорий")
