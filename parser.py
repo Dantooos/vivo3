@@ -15,6 +15,7 @@ from config import AppConfig, load_config
 from ua_proxy import ProxyManager, UserAgentManager
 
 BASE_DIR = Path(__file__).resolve().parent
+DEBUG_PARSER = True
 
 
 def _extract_idphone(url: str) -> Optional[str]:
@@ -60,12 +61,16 @@ def get_seller_ads_count(
     except Exception:
         return None
 
-    # TODO: уточнить выражение под реальные форматы страницы
-    match = re.search(r"Počet inzerátů:\s*(\d+)", response.text)
-    if not match:
-        match = re.search(r"Inzerátů:\s*(\d+)", response.text)
-    if match:
-        return int(match.group(1))
+    patterns = [
+        r">Všechny inzeráty uživatele\s*\(([^<>]*?)\)\s*:",
+        r">(?:Všechny|Všetky)\s+inzeráty\s+uživat(?:ele|eľa|ela)\s*\(([^<>]*?)\)\s*:",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, response.text)
+        if match:
+            digits = re.sub(r"[^\d]", "", match.group(1))
+            if digits:
+                return int(digits)
     return None
 
 
@@ -77,12 +82,29 @@ def parse_ad_details(
     proxy_manager: ProxyManager,
     ua_manager: UserAgentManager,
     timeout: int,
+    log_callback: Optional[Callable[[str], None]] = None,
 ) -> dict:
     headers = {"User-Agent": ua_manager.next()}
     response = proxy_manager.request_with_retry(
         "GET", ad_url, headers=headers, timeout=timeout
     )
-    tree = html.fromstring(response.text)
+    html_text = response.text
+    tree = html.fromstring(html_text)
+
+    idphone_match = re.search(r"[?&]idphone=(\d+)", html_text)
+    idphone_found = idphone_match.group(1) if idphone_match else None
+    if not idphone_found:
+        tel_values = tree.xpath("//input[contains(@id,'teloverit')]/@value")
+        if tel_values:
+            digits = re.sub(r"[^\d]", "", tel_values[0])
+            idphone_found = digits or None
+    if not idphone_found:
+        tel_ids = tree.xpath("//input[contains(@id,'teloverit')]/@id")
+        if tel_ids:
+            digits = re.sub(r"[^\d]", "", tel_ids[0])
+            idphone_found = digits or None
+    if not idphone_found and log_callback:
+        log_callback(f"⚠️ idphone не найден | {ad_url}")
 
     title_list = tree.xpath("//h1[@class='nadpisdetail']/text()")
     title = title_list[0].strip() if title_list else None
@@ -92,7 +114,7 @@ def parse_ad_details(
     price = int(price_digits) if price_digits else None
 
     views_match = re.search(
-        r">Vidělo:</td><td[^<>]*?>(.*?)</td>", response.text
+        r">Vidělo:</td><td[^<>]*?>(.*?)</td>", html_text
     )
     views = None
     if views_match:
@@ -100,7 +122,7 @@ def parse_ad_details(
         views = int(views_digits) if views_digits else None
 
     created_match = re.search(
-        r"<span class=\"velikost10\">(.*?)</span>", response.text
+        r"<span class=\"velikost10\">(.*?)</span>", html_text
     )
     created_at = created_match.group(1).strip() if created_match else None
 
@@ -110,8 +132,15 @@ def parse_ad_details(
     has_field = 1 if tree.xpath("//input[contains(@id, 'teloverit')]") else 0
 
     seller_ads = get_seller_ads_count(
-        country, idphone or "", proxy_manager, ua_manager, timeout
+        country, idphone_found or "", proxy_manager, ua_manager, timeout
     )
+
+    if DEBUG_PARSER and log_callback:
+        log_callback(
+            "DEBUG parsed: "
+            f"price={price}, views={views}, has_field={has_field}, "
+            f"idphone={idphone_found}, seller_ads={seller_ads} | {ad_url}"
+        )
 
     return {
         "url": ad_url,
@@ -131,7 +160,9 @@ def ad_passes_filters(data: dict, cfg: AppConfig) -> tuple[bool, str, str]:
     if cfg.require_field and data.get("has_field") == 0:
         return False, "нет поля teloverit", "no_field"
     seller_ads = data.get("seller_ads")
-    if seller_ads is None or seller_ads > cfg.max_seller_ads:
+    if seller_ads is None:
+        return False, "seller_ads не распознан", "seller_ads_unknown"
+    if seller_ads > cfg.max_seller_ads:
         return (
             False,
             f"seller_ads={seller_ads} > max_seller_ads={cfg.max_seller_ads}",
@@ -211,6 +242,7 @@ def parser_loop(stop_event: threading.Event, log_callback: Callable[[str], None]
                             proxy_manager,
                             ua_manager,
                             cfg.request_timeout,
+                            log_callback=log_callback,
                         )
                     except Exception as exc:
                         log_callback(f"Ошибка парсинга {ad_url}: {exc}")
