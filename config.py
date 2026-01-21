@@ -28,10 +28,24 @@ class AppConfig:
     proxies: List[str] = field(default_factory=list)
     proxy_retries: int = 3
 
-    # Selenium / Incogniton
+    # Incogniton API
+    incogniton_api_base_url: str = "http://127.0.0.1:35000"
+
+    # Selenium / fallback hub
     selenium_hub_url: str = "http://127.0.0.1:4444/wd/hub"
 
     # Профили браузера
+    # список словарей:
+    # {
+    #   "profile_id": "uuid",
+    #   "start_after_sec": 0,
+    #   "min_delay": 300,
+    #   "max_delay": 400,
+    #   "enabled": true,
+    #   "disable_images": false,
+    #   "countries": ["cz", "sk"],
+    #   "categories": ["electronics", "cars"]
+    # }
     browser_profiles: List[Dict[str, Any]] = field(default_factory=list)
 
 

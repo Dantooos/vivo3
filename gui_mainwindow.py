@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import csv
 import threading
 from pathlib import Path
 from typing import Any, Dict, List
 
+import requests
 from PySide6.QtCore import Qt, Signal, QTimer, QUrl
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
@@ -26,6 +28,7 @@ from PySide6.QtWidgets import (
 )
 
 import db
+import incogniton_api
 from config import AppConfig, load_config, save_config
 from parser import parser_loop
 from workers import start_workers
@@ -39,7 +42,7 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("Bazos Parser")
-        self.resize(1000, 700)
+        self.resize(1100, 800)
 
         db.init_db()
 
@@ -60,8 +63,8 @@ class MainWindow(QMainWindow):
         self._init_ua_proxy_tab()
         self._init_profiles_tab()
         self._init_general_tab()
+        self._init_queue_tab()
         self._init_log_tab()
-        self._init_db_tab()
         self._init_controls()
 
         self.log_signal.connect(self._append_log)
@@ -131,15 +134,20 @@ class MainWindow(QMainWindow):
         self.proxy_text = QPlainTextEdit()
         layout.addWidget(self.proxy_text)
 
-        layout.addWidget(QLabel("Повторов при ошибке прокси:"))
+        controls_layout = QHBoxLayout()
         self.proxy_retries_spin = QSpinBox()
         self.proxy_retries_spin.setMaximum(10)
-        layout.addWidget(self.proxy_retries_spin)
-
-        layout.addWidget(QLabel("HTTP таймаут (сек):"))
         self.request_timeout_spin = QSpinBox()
         self.request_timeout_spin.setMaximum(120)
-        layout.addWidget(self.request_timeout_spin)
+        controls_layout.addWidget(QLabel("Повторов при ошибке прокси:"))
+        controls_layout.addWidget(self.proxy_retries_spin)
+        controls_layout.addWidget(QLabel("HTTP таймаут (сек):"))
+        controls_layout.addWidget(self.request_timeout_spin)
+        layout.addLayout(controls_layout)
+
+        check_btn = QPushButton("Проверить прокси")
+        check_btn.clicked.connect(self._check_proxies)
+        layout.addWidget(check_btn)
 
         layout.addStretch()
         self.tabs.addTab(self.ua_proxy_tab, "User-Agent / Proxy")
@@ -148,9 +156,19 @@ class MainWindow(QMainWindow):
         self.profiles_tab = QWidget()
         layout = QVBoxLayout(self.profiles_tab)
 
-        self.profiles_table = QTableWidget(0, 4)
+        layout.addWidget(QLabel("Профили в работе"))
+        self.profiles_table = QTableWidget(0, 8)
         self.profiles_table.setHorizontalHeaderLabels(
-            ["Включён", "ID профиля", "min_delay", "max_delay"]
+            [
+                "Включён",
+                "ID профиля",
+                "start_after_sec",
+                "min_delay",
+                "max_delay",
+                "disable_images",
+                "countries",
+                "categories",
+            ]
         )
         self.profiles_table.horizontalHeader().setStretchLastSection(True)
         layout.addWidget(self.profiles_table)
@@ -164,13 +182,37 @@ class MainWindow(QMainWindow):
         button_layout.addWidget(remove_btn)
         layout.addLayout(button_layout)
 
+        layout.addWidget(QLabel("Профили из Incogniton"))
+        self.incogniton_table = QTableWidget(0, 4)
+        self.incogniton_table.setHorizontalHeaderLabels(
+            ["ID", "Name", "Group", "Status"]
+        )
+        self.incogniton_table.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(self.incogniton_table)
+
+        incogniton_buttons = QHBoxLayout()
+        refresh_btn = QPushButton("Обновить из Incogniton")
+        refresh_btn.clicked.connect(self._refresh_incogniton_profiles)
+        add_selected_btn = QPushButton("Добавить выбранный в работу")
+        add_selected_btn.clicked.connect(self._add_selected_incogniton_profile)
+        add_launched_btn = QPushButton("Добавить все запущенные")
+        add_launched_btn.clicked.connect(self._add_launched_profiles)
+        incogniton_buttons.addWidget(refresh_btn)
+        incogniton_buttons.addWidget(add_selected_btn)
+        incogniton_buttons.addWidget(add_launched_btn)
+        layout.addLayout(incogniton_buttons)
+
         self.tabs.addTab(self.profiles_tab, "Профили браузера")
 
     def _init_general_tab(self) -> None:
         self.general_tab = QWidget()
         layout = QVBoxLayout(self.general_tab)
 
-        layout.addWidget(QLabel("Selenium hub URL"))
+        layout.addWidget(QLabel("Incogniton API Base URL"))
+        self.incogniton_api_edit = QLineEdit()
+        layout.addWidget(self.incogniton_api_edit)
+
+        layout.addWidget(QLabel("Selenium hub URL (fallback)"))
         self.selenium_url_edit = QLineEdit()
         layout.addWidget(self.selenium_url_edit)
 
@@ -186,6 +228,56 @@ class MainWindow(QMainWindow):
         layout.addStretch()
         self.tabs.addTab(self.general_tab, "Общие")
 
+    def _init_queue_tab(self) -> None:
+        self.queue_tab = QWidget()
+        layout = QVBoxLayout(self.queue_tab)
+
+        stats_layout = QHBoxLayout()
+        self.seen_total_label = QLabel("Seen: 0")
+        self.queue_total_label = QLabel("Queue total: 0")
+        self.queue_new_label = QLabel("New: 0")
+        self.queue_sent_label = QLabel("Sent: 0")
+        self.queue_opened_label = QLabel("Opened: 0")
+        self.queue_error_label = QLabel("Error: 0")
+        stats_layout.addWidget(self.seen_total_label)
+        stats_layout.addWidget(self.queue_total_label)
+        stats_layout.addWidget(self.queue_new_label)
+        stats_layout.addWidget(self.queue_sent_label)
+        stats_layout.addWidget(self.queue_opened_label)
+        stats_layout.addWidget(self.queue_error_label)
+        layout.addLayout(stats_layout)
+
+        self.queue_table = QTableWidget(0, 6)
+        self.queue_table.setHorizontalHeaderLabels(
+            ["url", "status", "added_ts", "profile_id", "sent_ts", "opened_ts"]
+        )
+        self.queue_table.horizontalHeader().setStretchLastSection(True)
+        self.queue_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.queue_table.setSelectionMode(QTableWidget.ExtendedSelection)
+        layout.addWidget(self.queue_table)
+
+        controls_layout = QHBoxLayout()
+        refresh_btn = QPushButton("Обновить")
+        refresh_btn.clicked.connect(self._refresh_queue_view)
+        clear_btn = QPushButton("Очистить очередь")
+        clear_btn.clicked.connect(self._clear_queue)
+        export_btn = QPushButton("Экспорт CSV")
+        export_btn.clicked.connect(self._export_queue_csv)
+        copy_btn = QPushButton("Скопировать выделенные url")
+        copy_btn.clicked.connect(self._copy_selected_queue_urls)
+        controls_layout.addWidget(refresh_btn)
+        controls_layout.addWidget(clear_btn)
+        controls_layout.addWidget(export_btn)
+        controls_layout.addWidget(copy_btn)
+        layout.addLayout(controls_layout)
+
+        self.tabs.addTab(self.queue_tab, "База/Очередь")
+
+        self.queue_timer = QTimer(self)
+        self.queue_timer.setInterval(3000)
+        self.queue_timer.timeout.connect(self._refresh_queue_view)
+        self.queue_timer.start()
+
     def _init_log_tab(self) -> None:
         self.log_tab = QWidget()
         layout = QVBoxLayout(self.log_tab)
@@ -193,61 +285,6 @@ class MainWindow(QMainWindow):
         self.log_output.setReadOnly(True)
         layout.addWidget(self.log_output)
         self.tabs.addTab(self.log_tab, "Лог")
-
-    def _init_db_tab(self) -> None:
-        self.db_tab = QWidget()
-        layout = QVBoxLayout(self.db_tab)
-
-        stats_layout = QHBoxLayout()
-        self.db_total_label = QLabel("Total: 0")
-        self.db_new_label = QLabel("New: 0")
-        self.db_in_progress_label = QLabel("InProgress: 0")
-        self.db_opened_label = QLabel("Opened: 0")
-        self.db_error_label = QLabel("Error: 0")
-        stats_layout.addWidget(self.db_total_label)
-        stats_layout.addWidget(self.db_new_label)
-        stats_layout.addWidget(self.db_in_progress_label)
-        stats_layout.addWidget(self.db_opened_label)
-        stats_layout.addWidget(self.db_error_label)
-        layout.addLayout(stats_layout)
-
-        self.db_table = QTableWidget(0, 9)
-        self.db_table.setHorizontalHeaderLabels(
-            [
-                "id",
-                "country",
-                "category",
-                "price",
-                "views",
-                "seller_ads",
-                "status",
-                "first_seen",
-                "url",
-            ]
-        )
-        self.db_table.horizontalHeader().setStretchLastSection(True)
-        self.db_table.setSelectionBehavior(QTableWidget.SelectRows)
-        self.db_table.setSelectionMode(QTableWidget.SingleSelection)
-        layout.addWidget(self.db_table)
-
-        controls_layout = QHBoxLayout()
-        refresh_btn = QPushButton("Обновить")
-        refresh_btn.clicked.connect(self._refresh_db_view)
-        copy_btn = QPushButton("Скопировать URL")
-        copy_btn.clicked.connect(self._copy_selected_url)
-        open_btn = QPushButton("Открыть URL")
-        open_btn.clicked.connect(self._open_selected_url)
-        controls_layout.addWidget(refresh_btn)
-        controls_layout.addWidget(copy_btn)
-        controls_layout.addWidget(open_btn)
-        layout.addLayout(controls_layout)
-
-        self.tabs.addTab(self.db_tab, "База")
-
-        self.db_timer = QTimer(self)
-        self.db_timer.setInterval(3000)
-        self.db_timer.timeout.connect(self._refresh_db_view)
-        self.db_timer.start()
 
     def _init_controls(self) -> None:
         control_widget = QWidget()
@@ -283,54 +320,118 @@ class MainWindow(QMainWindow):
     def _append_log(self, message: str) -> None:
         self.log_output.appendPlainText(message)
 
-    def _refresh_db_view(self) -> None:
-        counts = db.get_counts_by_status()
-        self.db_total_label.setText(f"Total: {counts.get('total', 0)}")
-        self.db_new_label.setText(f"New: {counts.get('new', 0)}")
-        self.db_in_progress_label.setText(
-            f"InProgress: {counts.get('in_progress', 0)}"
-        )
-        self.db_opened_label.setText(f"Opened: {counts.get('opened', 0)}")
-        self.db_error_label.setText(f"Error: {counts.get('error', 0)}")
+    def _check_proxies(self) -> None:
+        proxies = [
+            line.strip()
+            for line in self.proxy_text.toPlainText().splitlines()
+            if line.strip()
+        ]
+        if not proxies:
+            self._append_log("Прокси не заданы.")
+            return
+        timeout = self.request_timeout_spin.value()
+        for proxy in proxies:
+            try:
+                response = requests.get(
+                    "https://httpbin.org/ip",
+                    proxies={"http": proxy, "https": proxy},
+                    timeout=timeout,
+                )
+                self._append_log(
+                    f"Прокси {proxy}: {response.status_code} {response.text.strip()}"
+                )
+            except Exception as exc:
+                self._append_log(f"Прокси {proxy}: ошибка {exc}")
 
-        rows = db.get_recent_ads()
-        self.db_table.setRowCount(0)
-        for row_data in rows:
-            ad_id, url, price, views, seller_ads, country, category, status, first_seen = (
-                row_data
-            )
-            row = self.db_table.rowCount()
-            self.db_table.insertRow(row)
-            self.db_table.setItem(row, 0, QTableWidgetItem(str(ad_id)))
-            self.db_table.setItem(row, 1, QTableWidgetItem(country or ""))
-            self.db_table.setItem(row, 2, QTableWidgetItem(category or ""))
-            self.db_table.setItem(row, 3, QTableWidgetItem(str(price or "")))
-            self.db_table.setItem(row, 4, QTableWidgetItem(str(views or "")))
-            self.db_table.setItem(row, 5, QTableWidgetItem(str(seller_ads or "")))
-            self.db_table.setItem(row, 6, QTableWidgetItem(status or ""))
-            self.db_table.setItem(row, 7, QTableWidgetItem(first_seen or ""))
-            self.db_table.setItem(row, 8, QTableWidgetItem(url or ""))
+    def _refresh_incogniton_profiles(self) -> None:
+        self.incogniton_table.setRowCount(0)
+        api_base = self.incogniton_api_edit.text().strip()
+        if not api_base:
+            return
+        try:
+            profiles = incogniton_api.list_profiles(api_base)
+        except Exception as exc:
+            self._append_log(f"Incogniton API ошибка: {exc}")
+            return
 
-    def _get_selected_url(self) -> str | None:
-        row = self.db_table.currentRow()
+        for profile in profiles:
+            profile_id = str(profile.get("id") or profile.get("profileId") or "")
+            name = profile.get("name", "")
+            group = profile.get("group", "")
+            status = profile.get("status", "")
+            row = self.incogniton_table.rowCount()
+            self.incogniton_table.insertRow(row)
+            self.incogniton_table.setItem(row, 0, QTableWidgetItem(profile_id))
+            self.incogniton_table.setItem(row, 1, QTableWidgetItem(str(name)))
+            self.incogniton_table.setItem(row, 2, QTableWidgetItem(str(group)))
+            self.incogniton_table.setItem(row, 3, QTableWidgetItem(str(status)))
+
+    def _add_selected_incogniton_profile(self) -> None:
+        row = self.incogniton_table.currentRow()
         if row < 0:
-            return None
-        item = self.db_table.item(row, 8)
-        if not item:
-            return None
-        return item.text().strip() or None
-
-    def _copy_selected_url(self) -> None:
-        url = self._get_selected_url()
-        if not url:
             return
-        QApplication.clipboard().setText(url)
-
-    def _open_selected_url(self) -> None:
-        url = self._get_selected_url()
-        if not url:
+        profile_id_item = self.incogniton_table.item(row, 0)
+        if not profile_id_item:
             return
-        QDesktopServices.openUrl(QUrl(url))
+        self._add_profile_row({"profile_id": profile_id_item.text(), "enabled": True})
+
+    def _add_launched_profiles(self) -> None:
+        for row in range(self.incogniton_table.rowCount()):
+            status_item = self.incogniton_table.item(row, 3)
+            profile_id_item = self.incogniton_table.item(row, 0)
+            if not status_item or not profile_id_item:
+                continue
+            status = status_item.text().lower()
+            if status in {"launched", "ready"}:
+                self._add_profile_row({"profile_id": profile_id_item.text(), "enabled": True})
+
+    def _refresh_queue_view(self) -> None:
+        seen_total = db.get_seen_count()
+        queue_counts = db.get_queue_counts()
+        self.seen_total_label.setText(f"Seen: {seen_total}")
+        self.queue_total_label.setText(f"Queue total: {queue_counts.get('total', 0)}")
+        self.queue_new_label.setText(f"New: {queue_counts.get('new', 0)}")
+        self.queue_sent_label.setText(f"Sent: {queue_counts.get('sent', 0)}")
+        self.queue_opened_label.setText(f"Opened: {queue_counts.get('opened', 0)}")
+        self.queue_error_label.setText(f"Error: {queue_counts.get('error', 0)}")
+
+        rows = db.get_recent_queue()
+        self.queue_table.setRowCount(0)
+        for row_data in rows:
+            url, status, added_ts, profile_id, sent_ts, opened_ts = row_data
+            row = self.queue_table.rowCount()
+            self.queue_table.insertRow(row)
+            self.queue_table.setItem(row, 0, QTableWidgetItem(url or ""))
+            self.queue_table.setItem(row, 1, QTableWidgetItem(status or ""))
+            self.queue_table.setItem(row, 2, QTableWidgetItem(added_ts or ""))
+            self.queue_table.setItem(row, 3, QTableWidgetItem(profile_id or ""))
+            self.queue_table.setItem(row, 4, QTableWidgetItem(sent_ts or ""))
+            self.queue_table.setItem(row, 5, QTableWidgetItem(opened_ts or ""))
+
+    def _clear_queue(self) -> None:
+        db.clear_queue()
+        self._refresh_queue_view()
+
+    def _export_queue_csv(self) -> None:
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Экспорт CSV", "queue.csv", "CSV Files (*.csv)"
+        )
+        if not path:
+            return
+        rows = db.get_recent_queue()
+        with open(path, "w", newline="", encoding="utf-8") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(["url", "status", "added_ts", "profile_id", "sent_ts", "opened_ts"])
+            writer.writerows(rows)
+        self._append_log(f"CSV сохранён: {path}")
+
+    def _copy_selected_queue_urls(self) -> None:
+        urls: List[str] = []
+        for item in self.queue_table.selectedItems():
+            if item.column() == 0:
+                urls.append(item.text())
+        if urls:
+            QApplication.clipboard().setText("\n".join(urls))
 
     def _load_config_into_ui(self) -> None:
         cfg = self.cfg
@@ -344,6 +445,7 @@ class MainWindow(QMainWindow):
         self.proxy_text.setPlainText("\n".join(cfg.proxies))
         self.proxy_retries_spin.setValue(cfg.proxy_retries)
         self.request_timeout_spin.setValue(cfg.request_timeout)
+        self.incogniton_api_edit.setText(cfg.incogniton_api_base_url)
         self.selenium_url_edit.setText(cfg.selenium_hub_url)
         self.parser_interval_spin.setValue(cfg.parser_interval_seconds)
         self._load_profiles(cfg.browser_profiles)
@@ -357,22 +459,39 @@ class MainWindow(QMainWindow):
     def _add_profile_row(self, profile: Dict[str, Any] | None = None) -> None:
         row = self.profiles_table.rowCount()
         self.profiles_table.insertRow(row)
+        profile = profile or {}
 
         enabled_item = QTableWidgetItem()
         enabled_item.setFlags(enabled_item.flags() | Qt.ItemIsUserCheckable)
         enabled_item.setCheckState(
-            Qt.Checked if (profile or {}).get("enabled", True) else Qt.Unchecked
+            Qt.Checked if profile.get("enabled", True) else Qt.Unchecked
         )
         self.profiles_table.setItem(row, 0, enabled_item)
 
-        profile_id_item = QTableWidgetItem(str((profile or {}).get("profile_id", 1)))
+        profile_id_item = QTableWidgetItem(str(profile.get("profile_id", "")))
         self.profiles_table.setItem(row, 1, profile_id_item)
 
-        min_delay_item = QTableWidgetItem(str((profile or {}).get("min_delay", 60)))
-        self.profiles_table.setItem(row, 2, min_delay_item)
+        start_after_item = QTableWidgetItem(str(profile.get("start_after_sec", 0)))
+        self.profiles_table.setItem(row, 2, start_after_item)
 
-        max_delay_item = QTableWidgetItem(str((profile or {}).get("max_delay", 120)))
-        self.profiles_table.setItem(row, 3, max_delay_item)
+        min_delay_item = QTableWidgetItem(str(profile.get("min_delay", 60)))
+        self.profiles_table.setItem(row, 3, min_delay_item)
+
+        max_delay_item = QTableWidgetItem(str(profile.get("max_delay", 120)))
+        self.profiles_table.setItem(row, 4, max_delay_item)
+
+        disable_images_item = QTableWidgetItem()
+        disable_images_item.setFlags(disable_images_item.flags() | Qt.ItemIsUserCheckable)
+        disable_images_item.setCheckState(
+            Qt.Checked if profile.get("disable_images", False) else Qt.Unchecked
+        )
+        self.profiles_table.setItem(row, 5, disable_images_item)
+
+        countries_item = QTableWidgetItem(",".join(profile.get("countries", [])))
+        self.profiles_table.setItem(row, 6, countries_item)
+
+        categories_item = QTableWidgetItem(",".join(profile.get("categories", [])))
+        self.profiles_table.setItem(row, 7, categories_item)
 
     def _remove_selected_profile(self) -> None:
         row = self.profiles_table.currentRow()
@@ -383,15 +502,33 @@ class MainWindow(QMainWindow):
         profiles: List[Dict[str, Any]] = []
         for row in range(self.profiles_table.rowCount()):
             enabled = self.profiles_table.item(row, 0).checkState() == Qt.Checked
-            profile_id = int(self.profiles_table.item(row, 1).text())
-            min_delay = int(self.profiles_table.item(row, 2).text())
-            max_delay = int(self.profiles_table.item(row, 3).text())
+            profile_id = self.profiles_table.item(row, 1).text().strip()
+            start_after = int(self.profiles_table.item(row, 2).text())
+            min_delay = int(self.profiles_table.item(row, 3).text())
+            max_delay = int(self.profiles_table.item(row, 4).text())
+            disable_images = (
+                self.profiles_table.item(row, 5).checkState() == Qt.Checked
+            )
+            countries = [
+                value.strip()
+                for value in self.profiles_table.item(row, 6).text().split(",")
+                if value.strip()
+            ]
+            categories = [
+                value.strip()
+                for value in self.profiles_table.item(row, 7).text().split(",")
+                if value.strip()
+            ]
             profiles.append(
                 {
                     "enabled": enabled,
                     "profile_id": profile_id,
+                    "start_after_sec": start_after,
                     "min_delay": min_delay,
                     "max_delay": max_delay,
+                    "disable_images": disable_images,
+                    "countries": countries,
+                    "categories": categories,
                 }
             )
         return profiles
@@ -417,6 +554,7 @@ class MainWindow(QMainWindow):
                 if line.strip()
             ],
             proxy_retries=self.proxy_retries_spin.value(),
+            incogniton_api_base_url=self.incogniton_api_edit.text().strip(),
             selenium_hub_url=self.selenium_url_edit.text().strip(),
             browser_profiles=self._collect_profiles(),
         )

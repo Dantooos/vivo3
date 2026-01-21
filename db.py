@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -20,22 +20,24 @@ def init_db(db_path: str = "data.db") -> None:
     try:
         conn.execute(
             """
-            CREATE TABLE IF NOT EXISTS ads (
-                id            INTEGER PRIMARY KEY AUTOINCREMENT,
-                url           TEXT UNIQUE,
-                country       TEXT,
-                category      TEXT,
-                title         TEXT,
-                price         INTEGER,
-                views         INTEGER,
-                seller_ads    INTEGER,
-                has_field     INTEGER,
-                created_at    TEXT,
-                seller_name   TEXT,
-                first_seen    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                status        TEXT DEFAULT 'new',
-                profile_id    INTEGER,
-                opened_at     TIMESTAMP
+            CREATE TABLE IF NOT EXISTS seen_urls (
+                url TEXT PRIMARY KEY,
+                first_seen_ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                country TEXT,
+                category TEXT
+            );
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ads_queue (
+                url TEXT PRIMARY KEY,
+                added_ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                status TEXT DEFAULT 'new',
+                last_error TEXT,
+                assigned_profile_id TEXT,
+                sent_ts TIMESTAMP,
+                opened_ts TIMESTAMP
             );
             """
         )
@@ -44,29 +46,15 @@ def init_db(db_path: str = "data.db") -> None:
         conn.close()
 
 
-def insert_ad_if_new(data: dict, db_path: str = "data.db") -> bool:
+def insert_seen_url(
+    url: str, country: str, category: str, db_path: str = "data.db"
+) -> bool:
     path = _db_path(db_path)
     conn = sqlite3.connect(path, check_same_thread=False)
     try:
         conn.execute(
-            """
-            INSERT OR IGNORE INTO ads (
-                url, country, category, title, price, views, seller_ads, has_field,
-                created_at, seller_name
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                data.get("url"),
-                data.get("country"),
-                data.get("category"),
-                data.get("title"),
-                data.get("price"),
-                data.get("views"),
-                data.get("seller_ads"),
-                data.get("has_field"),
-                data.get("created_at"),
-                data.get("seller_name"),
-            ),
+            "INSERT OR IGNORE INTO seen_urls (url, country, category) VALUES (?, ?, ?)",
+            (url, country, category),
         )
         inserted = conn.execute("SELECT changes()").fetchone()[0] == 1
         conn.commit()
@@ -75,32 +63,71 @@ def insert_ad_if_new(data: dict, db_path: str = "data.db") -> bool:
         conn.close()
 
 
-def get_next_ad_for_profile(
-    profile_id: int, db_path: str = "data.db"
-) -> Optional[Tuple[int, str]]:
+def enqueue_url(url: str, db_path: str = "data.db") -> bool:
+    path = _db_path(db_path)
+    conn = sqlite3.connect(path, check_same_thread=False)
+    try:
+        conn.execute(
+            "INSERT OR IGNORE INTO ads_queue (url, status) VALUES (?, 'new')",
+            (url,),
+        )
+        inserted = conn.execute("SELECT changes()").fetchone()[0] == 1
+        conn.commit()
+        return inserted
+    finally:
+        conn.close()
+
+
+def get_next_queue_item(
+    profile_id: str,
+    countries: Optional[List[str]] = None,
+    categories: Optional[List[str]] = None,
+    db_path: str = "data.db",
+) -> Optional[Tuple[str]]:
     path = _db_path(db_path)
     conn = sqlite3.connect(path, check_same_thread=False)
     try:
         conn.isolation_level = None
         conn.execute("BEGIN EXCLUSIVE")
-        row = conn.execute(
-            """
-            SELECT id, url FROM ads
-            WHERE status = 'new'
-            ORDER BY first_seen ASC
+
+        filters = ["q.status = 'new'"]
+        params: List[str] = []
+
+        if countries:
+            placeholders = ",".join(["?"] * len(countries))
+            filters.append(f"s.country IN ({placeholders})")
+            params.extend(countries)
+        if categories:
+            placeholders = ",".join(["?"] * len(categories))
+            filters.append(f"s.category IN ({placeholders})")
+            params.extend(categories)
+
+        where_clause = " AND ".join(filters)
+
+        query = f"""
+            SELECT q.url
+            FROM ads_queue q
+            JOIN seen_urls s ON s.url = q.url
+            WHERE {where_clause}
+            ORDER BY q.added_ts ASC
             LIMIT 1
-            """
-        ).fetchone()
+        """
+        row = conn.execute(query, params).fetchone()
         if row is None:
             conn.execute("COMMIT")
             return None
-        ad_id, url = row
+
+        (url,) = row
         conn.execute(
-            "UPDATE ads SET status = 'in_progress', profile_id = ? WHERE id = ?",
-            (profile_id, ad_id),
+            """
+            UPDATE ads_queue
+            SET status = 'sent', assigned_profile_id = ?, sent_ts = CURRENT_TIMESTAMP
+            WHERE url = ?
+            """,
+            (profile_id, url),
         )
         conn.execute("COMMIT")
-        return ad_id, url
+        return (url,)
     except sqlite3.Error:
         conn.execute("ROLLBACK")
         return None
@@ -108,38 +135,50 @@ def get_next_ad_for_profile(
         conn.close()
 
 
-def mark_ad_opened(ad_id: int, db_path: str = "data.db") -> None:
+def mark_queue_opened(url: str, db_path: str = "data.db") -> None:
     path = _db_path(db_path)
     conn = sqlite3.connect(path, check_same_thread=False)
     try:
         conn.execute(
-            "UPDATE ads SET status = 'opened', opened_at = CURRENT_TIMESTAMP WHERE id = ?",
-            (ad_id,),
+            "UPDATE ads_queue SET status = 'opened', opened_ts = CURRENT_TIMESTAMP WHERE url = ?",
+            (url,),
         )
         conn.commit()
     finally:
         conn.close()
 
 
-def mark_ad_error(ad_id: int, message: str, db_path: str = "data.db") -> None:
+def mark_queue_error(url: str, message: str, db_path: str = "data.db") -> None:
     path = _db_path(db_path)
     conn = sqlite3.connect(path, check_same_thread=False)
     try:
-        conn.execute("UPDATE ads SET status = 'error' WHERE id = ?", (ad_id,))
+        conn.execute(
+            "UPDATE ads_queue SET status = 'error', last_error = ? WHERE url = ?",
+            (message, url),
+        )
         conn.commit()
     finally:
         conn.close()
 
 
-def get_counts_by_status(db_path: str = "data.db") -> dict:
+def get_seen_count(db_path: str = "data.db") -> int:
+    path = _db_path(db_path)
+    conn = sqlite3.connect(path, check_same_thread=False)
+    try:
+        return conn.execute("SELECT COUNT(*) FROM seen_urls").fetchone()[0]
+    finally:
+        conn.close()
+
+
+def get_queue_counts(db_path: str = "data.db") -> dict:
     path = _db_path(db_path)
     conn = sqlite3.connect(path, check_same_thread=False)
     try:
         rows = conn.execute(
-            "SELECT status, COUNT(*) FROM ads GROUP BY status"
+            "SELECT status, COUNT(*) FROM ads_queue GROUP BY status"
         ).fetchall()
         counts = {"total": 0}
-        total = conn.execute("SELECT COUNT(*) FROM ads").fetchone()[0]
+        total = conn.execute("SELECT COUNT(*) FROM ads_queue").fetchone()[0]
         counts["total"] = total
         for status, count in rows:
             counts[status] = count
@@ -148,19 +187,29 @@ def get_counts_by_status(db_path: str = "data.db") -> dict:
         conn.close()
 
 
-def get_recent_ads(db_path: str = "data.db", limit: int = 200) -> list:
+def get_recent_queue(db_path: str = "data.db", limit: int = 200) -> list:
     path = _db_path(db_path)
     conn = sqlite3.connect(path, check_same_thread=False)
     try:
         rows = conn.execute(
             """
-            SELECT id, url, price, views, seller_ads, country, category, status, first_seen
-            FROM ads
-            ORDER BY first_seen DESC
+            SELECT url, status, added_ts, assigned_profile_id, sent_ts, opened_ts
+            FROM ads_queue
+            ORDER BY added_ts DESC
             LIMIT ?
             """,
             (limit,),
         ).fetchall()
         return rows
+    finally:
+        conn.close()
+
+
+def clear_queue(db_path: str = "data.db") -> None:
+    path = _db_path(db_path)
+    conn = sqlite3.connect(path, check_same_thread=False)
+    try:
+        conn.execute("DELETE FROM ads_queue")
+        conn.commit()
     finally:
         conn.close()
